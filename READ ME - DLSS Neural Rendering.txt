@@ -1,0 +1,120 @@
+DLSS 5 NEURAL RENDERING FOR OPTISCALER
+======================================
+
+Neural Rendering runs NVIDIA's DLSS 5 model over the frame the upscaler just produced, before the
+game draws its interface and before frame generation sees it. This is an unofficial integration:
+NVIDIA does not document or support it, and the model is driven directly through its own DLL.
+
+
+WHAT YOU NEED
+-------------
+
+Two files, named one character apart. Both go in the GAME folder -- the one holding the game's
+executable and the file OptiScaler was renamed to (dxgi.dll, winmm.dll, ...).
+
+  nvngx.dll_dlssnr.dll   about 13 KB    the forwarder. Ships in this package.
+  nvngx_dlssnr.dll       about 165 MB   NVIDIA's model. You supply it: it comes from an NVIDIA
+                                        driver package or a game that ships it, and cannot be
+                                        redistributed here.
+
+To check you have the right model file: right-click it > Properties > Details should read
+"NVIDIA DLSSNR" at about 165 MB. A file that size named nvngx_dlssd.dll is this model misnamed, not
+Ray Reconstruction -- installing it as Ray Reconstruction breaks that instead.
+
+One copy per game. There is no shared or system-wide location.
+
+The model reports an RTX 50 series (Blackwell) GPU as its minimum, and needs a driver new enough to
+ship it. If it cannot run on your system, the overlay says why rather than failing quietly.
+
+Euro Truck Simulator 2 / American Truck Simulator: the game folder is bin\win_x64 (Steam: right-click
+the game > Manage > Browse local files > bin > win_x64).
+
+
+INSTALL
+-------
+
+1. Extract everything in this package into the game folder and run setup_windows.bat, which renames
+   OptiScaler.dll for you. Updating an existing install instead: replace your OptiScaler DLL (keep the
+   name it already has there) and nvngx.dll_dlssnr.dll, and keep your own OptiScaler.ini.
+2. Copy nvngx_dlssnr.dll into the same folder.
+3. Start the game, press Insert to open the OptiScaler overlay, open "DLSS Neural Rendering" and tick
+   "Enable Neural Rendering". It is OFF by default. You can also set Enabled=true under [DlssNr] in
+   OptiScaler.ini.
+
+The status line under the checkbox says whether it is running and what it costs per frame. A key to
+toggle it in game can be bound under Keybinds > "Neural Rendering".
+
+
+KEEPING MORE THAN ONE MODEL
+---------------------------
+
+A newer nvngx_dlssnr.dll is a different model. The 310.9.16 build (first seen in an NBA 2K27 update)
+is reported as roughly twice as fast as the 310.8 builds, and it visibly does less. You can keep both
+and switch between them in game.
+
+Leave one as nvngx_dlssnr.dll in the game folder, and give each other copy a folder of its own under
+its original file name:
+
+  bin\win_x64\nvngx_dlssnr.dll                            (the default)
+  bin\win_x64\DlssNrModels\310.9.16\nvngx_dlssnr.dll      (any folder name you like)
+
+A renamed copy beside OptiScaler, such as nvngx_dlssnr_310.9.16.dll, is found too.
+
+In the overlay, "Model file" under the Model section lists every model found, with its version.
+Pick one and the model rebuilds -- one frame without the effect. Press Rescan after adding a file
+while the game is running. A model you have used stays loaded until the game closes, so switching
+back is immediate. The choice is saved as Model= under [DlssNr] in OptiScaler.ini.
+
+Switching mid-game needs the nvngx.dll_dlssnr.dll from THIS package. With an older one, the overlay
+says "Takes effect after a restart": pick the model, then restart the game.
+
+
+PASSES (1x TO 3x)
+-----------------
+
+"Passes" under the Cost section runs the model again on its own answer: 1 is the default and what
+the model was trained for, 2 and 3 compound the detail -- and anything it got wrong.
+
+  - Cost is close to linear: 2 passes take about twice the time, 3 about three times.
+  - Each extra pass keeps a model of its own, so VRAM use grows with the count.
+  - Local tone is applied by the first pass only, so the look does not stack warmth and contrast.
+  - Raising the count costs one frame without the effect while the new passes are built. On Vulkan,
+    any change is a brief hitch.
+  - Lowering "Model resolution" is how to pay for it: at 50% each pass costs about a quarter.
+
+The status line shows how many passes actually ran, e.g. "Running, 2 passes - 9.80 ms per frame".
+
+
+TROUBLESHOOTING
+---------------
+
+"Off for this session: ..." in the overlay names what failed. Fix the cause, then press Retry --
+no restart needed. Common ones:
+
+  ... nvngx.dll_dlssnr.dll ...              the forwarder is missing from the game folder
+  nvngx_dlssnr.dll was not found ...        the model is missing from the game folder
+  the chosen model would not initialise     pick another under Model file, then press Retry
+
+"<name> was not found -- the default is in use" under Model file means the model you chose has been
+moved or deleted. Pick another one or press Rescan.
+
+Nothing seems to change: check "Apply the model" is ticked, and compare with the Compare options,
+which show the frame with and without the effect.
+
+For a log, set LogToFile=true in OptiScaler.ini. OptiScaler.log appears beside the game; search it
+for "DLSS-NR" and "dlssnr" to find what Neural Rendering reported.
+
+
+REMOVING IT
+-----------
+
+Untick "Enable Neural Rendering" (or set Enabled=false under [DlssNr]), or delete nvngx_dlssnr.dll and
+nvngx.dll_dlssnr.dll from the game folder. Nothing else needs to change.
+
+
+CREDITS
+-------
+
+The colour composition is taken from RenoDX's DLSS 5 addon by clshortfuse
+(https://github.com/clshortfuse/renodx); see Licenses\RenoDX_ATTRIBUTION.txt. The model itself is
+NVIDIA's and is not part of this package.
