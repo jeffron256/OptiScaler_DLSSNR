@@ -465,16 +465,21 @@ class Config
     CustomOptional<float> DlssNrScanTrim { 1.0f };
 
     // How many times to run the model over the same frame, each pass fed the previous one's answer.
+    // 1 to 3; anything else is clamped where it is used.
     //
     // 1 is what the model was trained for and what every published number describes. Above that it
     // is being asked to enhance its own output, which is outside its training distribution: detail
-    // compounds, and so does anything it got wrong. Two often looks richer. Four usually looks
-    // synthetic. Eight is there because somebody will want to see it.
+    // compounds, and so does anything it got wrong. Past 3 the re-feed has converged and a whole model
+    // run buys almost nothing.
     //
-    // The cost is exactly linear -- the model is 98% of the frame's expense and every pass pays it
-    // again -- so 8 costs eight times, near enough. There is no shortcut and no amortisation: the
-    // passes are sequential and each one needs the last one's output.
+    // Every extra pass runs on a feature of its own, so each keeps its own history and VRAM grows with
+    // the count. The cost is close to linear -- the model is 98% of the frame's expense and every pass
+    // pays it again. The passes are sequential: each one needs the last one's output.
     CustomOptional<uint32_t> DlssNrPasses { 1 };
+
+    // Which nvngx_dlssnr.dll the model is loaded from, as a path relative to the folder it was found in
+    // (see dlssnr/DlssNr_Models.h). Empty is nvngx_dlssnr.dll, found exactly as before this existed.
+    CustomOptional<std::string> DlssNrModel { std::string() };
 
     // Which depth convention the model is told the guide uses.
     //

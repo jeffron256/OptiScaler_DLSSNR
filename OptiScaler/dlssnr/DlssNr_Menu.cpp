@@ -128,7 +128,14 @@ void RenderMenu(Config* config, float menuResScale)
         }
         else if (!DlssNr::IsRunning() && !vulkan)
         {
+            // Whichever backend gave up. Only one of them is ever in use, and the Vulkan one used to
+            // fail silently here -- which a refused model choice now makes worth reporting, with the
+            // same way back out.
             const char* reason = DlssNr::FailureReason();
+            const bool vulkanFailed = reason[0] == 0 && DlssNr::FailureReasonVk()[0] != 0;
+
+            if (vulkanFailed)
+                reason = DlssNr::FailureReasonVk();
 
             if (reason[0] != 0)
             {
@@ -136,7 +143,12 @@ void RenderMenu(Config* config, float menuResScale)
                 ImGui::SameLine();
 
                 if (ImGui::SmallButton("Retry"))
-                    DlssNr::RetryAfterFailure();
+                {
+                    if (vulkanFailed)
+                        DlssNr::RetryAfterFailureVk();
+                    else
+                        DlssNr::RetryAfterFailure();
+                }
             }
             else if (enabled)
                 ImGui::TextUnformatted("Waiting for the upscaler to run.");
@@ -156,15 +168,23 @@ void RenderMenu(Config* config, float menuResScale)
             const char* runSuffix =
                 !config->DlssNrApplyModel.value_or_default() ? "  (model running, edit hidden)" : "";
 
+            // The passes that actually ran, which is not always the number asked for: a raised count
+            // takes a frame to build, and a pass that will not build is left out.
+            const unsigned int passesRun = vulkan ? DlssNr::LastPassesVk() : DlssNr::LastPasses();
+            char passText[32] = {};
+
+            if (passesRun > 1)
+                snprintf(passText, sizeof(passText), ", %u passes", passesRun);
+
             if (ms.has_value())
-                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f), "Running%s - %.2f ms per frame%s",
-                                   vulkan ? " natively on Vulkan" : "", ms.value(), runSuffix);
+                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f), "Running%s%s - %.2f ms per frame%s",
+                                   vulkan ? " natively on Vulkan" : "", passText, ms.value(), runSuffix);
             else if (vulkan)
                 // Measured but not yet read: the first few frames are still in the query ring.
-                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f), "Running natively on Vulkan - %llu frames%s",
-                                   DlssNr::FramesVk(), runSuffix);
+                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f), "Running natively on Vulkan%s - %llu frames%s",
+                                   passText, DlssNr::FramesVk(), runSuffix);
             else
-                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f), "Running.%s", runSuffix);
+                ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f), "Running%s.%s", passText, runSuffix);
 
             ImGui::SameLine();
             ImGui::TextDisabled("(?)");
@@ -177,6 +197,71 @@ void RenderMenu(Config* config, float menuResScale)
 
         ImGui::Spacing();
         ImGui::PushItemWidth(220.0f * menuResScale);
+
+        ImGui::SeparatorText("Cost");
+
+        {
+            // Coloured by what it costs, because the number alone does not say. The model is 98% of
+            // this pass's expense and every pass pays it again: green at 1, which is what the model
+            // was trained for; amber at 2, where it is enhancing its own output; red at 3, the ceiling.
+            //
+            // Applied on release, like the resolution below. Every value is a feature built or
+            // released, and a drag from 1 to 3 would otherwise build one for 2 on the way past.
+            static int pendingPasses = -1;
+
+            int passes = pendingPasses >= 0 ? pendingPasses : (int) config->DlssNrPasses.value_or_default();
+            passes = std::clamp(passes, 1, 3);
+
+            const ImVec4 colour = passes <= 1   ? ImVec4(0.35f, 0.88f, 0.38f, 1.0f)
+                                  : passes <= 2 ? ImVec4(0.95f, 0.70f, 0.20f, 1.0f)
+                                                : ImVec4(0.92f, 0.30f, 0.25f, 1.0f);
+
+            ImGui::PushStyleColor(ImGuiCol_Text, colour);
+            ImGui::PushStyleColor(ImGuiCol_SliderGrab, colour);
+
+            if (ImGui::SliderInt("Passes", &passes, 1, 3, passes == 1 ? "%dx (native)" : "%dx"))
+                pendingPasses = passes;
+
+            if (ImGui::IsItemDeactivatedAfterEdit() && pendingPasses >= 0)
+            {
+                config->DlssNrPasses = (uint32_t) std::clamp(pendingPasses, 1, 3);
+                pendingPasses = -1;
+            }
+
+            ImGui::PopStyleColor(2);
+
+            HelpMarker("How many times the model runs over each frame, each pass handed the previous"
+                       "
+one's answer. 1 is the default."
+                       "
+
+COST IS LINEAR. The model is about 98% of what this pass spends, so two"
+                       "
+passes take about twice the time and three about three times. Each extra"
+                       "
+pass also keeps a model of its own, with its own history, so VRAM grows with"
+                       "
+the count."
+                       "
+
+1 is what the model was trained for. Above it the model is enhancing its own"
+                       "
+output: detail compounds, and so does anything it got wrong. 3 is the ceiling --"
+                       "
+re-feeding converges, and a fourth pass would change almost nothing."
+                       "
+
+Detail repeats; tone does not. Local tone is applied by the first pass only,"
+                       "
+so the look does not stack warmth and contrast."
+                       "
+
+Model resolution below is how to pay for it: at 50% each pass costs about a"
+                       "
+quarter. A raised count takes one frame without the model while the new passes"
+                       "
+are built; on Vulkan any change is a brief hitch.");
+        }
 
         // Any percentage, rather than a handful of steps somebody chose in advance. The lower bound
         // is 25%: below that the model is working on so little of the picture that its answer no
@@ -341,6 +426,99 @@ void RenderMenu(Config* config, float menuResScale)
                        "\n\nOff is byte-identical to before.");
 
         ImGui::SeparatorText("Model");
+
+        // Which nvngx_dlssnr.dll. Listed from what is on disk rather than typed, and a choice only when
+        // there is one: with a single model there is nothing to switch to, so it is shown, not offered.
+        {
+            const auto models = DlssNr::Models::List();
+            const std::string chosen = config->DlssNrModel.value_or_default();
+
+            bool fellBack = false;
+            DlssNr::Models::Resolve(chosen, &fellBack);
+
+            auto labelOf = [](const DlssNr::Models::Candidate& c)
+            {
+                std::string name =
+                    c.id.empty() ? "Default (" + wstring_to_string(c.path.filename().wstring()) + ")" : c.id;
+                return c.version.empty() ? name : name + "  -  " + c.version;
+            };
+
+            int current = -1;
+
+            for (int i = 0; i < (int) models.size(); ++i)
+            {
+                if (models[i].id == chosen)
+                    current = i;
+            }
+
+            if (models.empty())
+            {
+                ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.20f, 1.0f),
+                                   "No nvngx_dlssnr.dll found beside OptiScaler or the game.");
+            }
+            else if (models.size() == 1 && current == 0)
+            {
+                ImGui::Text("Model file: %s", labelOf(models[0]).c_str());
+            }
+            else
+            {
+                // A choice that is not in the list still shows as the choice -- one typed into the ini by
+                // hand is not in it either -- and only one that resolves to nothing is called missing,
+                // so the line below can say what happened rather than the combo showing something else.
+                const std::string preview = current >= 0 ? labelOf(models[current])
+                                            : fellBack   ? chosen + "  (missing)"
+                                                         : chosen;
+
+                if (ImGui::BeginCombo("Model file", preview.c_str()))
+                {
+                    for (int i = 0; i < (int) models.size(); ++i)
+                    {
+                        if (ImGui::Selectable(labelOf(models[i]).c_str(), i == current))
+                            config->DlssNrModel = models[i].id;
+
+                        if (i == current)
+                            ImGui::SetItemDefaultFocus();
+                    }
+
+                    ImGui::EndCombo();
+                }
+            }
+
+            ImGui::SameLine();
+
+            if (ImGui::SmallButton("Rescan##models"))
+                DlssNr::Models::List(true);
+
+            HelpMarker("Which build of NVIDIA's model to load. A newer nvngx_dlssnr.dll is a different"
+                       "\nmodel: 310.9.16 is reported as roughly twice as fast as the 310.8 builds, and"
+                       "\nit visibly does less."
+                       "\n\nTo keep more than one, give each extra copy a folder of its own, beside"
+                       "\nOptiScaler or the game, under its original name:"
+                       "\n  DlssNrModels\\310.9.16\\nvngx_dlssnr.dll"
+                       "\nA renamed copy beside OptiScaler, such as nvngx_dlssnr_310.9.16.dll, is found"
+                       "\ntoo. Press Rescan after adding one."
+                       "\n\nSwitching rebuilds the model: one frame without it, and every setting here"
+                       "\ncarries over. A model you have used stays loaded until the game closes, so"
+                       "\nswitching back is immediate.");
+
+            const Models::Status d3d12 = DlssNr::ActiveModelStatus();
+            const Models::Status vk = DlssNr::ActiveModelStatusVk();
+            const Models::Status& status = vk.running.empty() ? d3d12 : vk;
+
+            if (fellBack)
+                ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.20f, 1.0f), "%s was not found -- the default is in use.",
+                                   chosen.c_str());
+
+            if (d3d12.needsRestart || vk.needsRestart)
+                ImGui::TextColored(ImVec4(0.95f, 0.70f, 0.20f, 1.0f),
+                                   "Takes effect after a restart: this nvngx.dll_dlssnr.dll is an older build\n"
+                                   "that keeps the first model it loads.");
+
+            if (!status.running.empty())
+                ImGui::TextDisabled("In use: %s", status.version.empty()
+                                                      ? wstring_to_string(status.running.filename().wstring()).c_str()
+                                                      : status.version.c_str());
+        }
 
         ImGui::TextUnformatted("Read when the model is built, so a change rebuilds it after a moment.");
 

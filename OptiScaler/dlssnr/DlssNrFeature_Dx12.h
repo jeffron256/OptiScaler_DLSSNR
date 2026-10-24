@@ -5,6 +5,10 @@
 #include <shaders/dlssnr/DlssNr_Common.h>
 #include <nvsdk_ngx.h>
 
+#include "DlssNr_Models.h"
+
+#include <optional>
+
 // DLSS 5 Neural Rendering, run over the upscaler's output.
 //
 // Neural Rendering is a post-process, not an upscaler and not a denoiser: it takes a finished frame plus
@@ -46,6 +50,12 @@ void RenderMenu(::Config* config, float menuResScale);
 
 // Clears the session failure latch, so a failure caused by transient thrash does not cost a restart.
 void RetryAfterFailure();
+
+// How many model passes the last frame ran. 0 before anything has run.
+unsigned int LastPasses();
+
+// Which model file is running, for the menu.
+Models::Status ActiveModelStatus();
 
 
 // Asks the model whether it will work on Direct3D 11 at all, once, and logs the answer.

@@ -4,6 +4,8 @@
 
 #include <shaders/dlssnr/DlssNr_Common.h>
 
+#include "DlssNr_Models.h"
+
 #include <optional>
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_vk.h>
@@ -61,6 +63,13 @@ std::optional<double> LastGpuTimeVk();
 // binding the game's image means naming a layout this side cannot know. For the menu, and to settle
 // whether reading it is worth the risk on any real Vulkan game.
 bool ExposureOfferedVk();
+
+// How many model passes the last frame ran, and which model file is running. For the menu.
+unsigned int LastPassesVk();
+Models::Status ActiveModelStatusVk();
+
+// Clears the failure latch, so a refused model choice can be undone without a restart.
+void RetryAfterFailureVk();
 
 void ShutdownVk(bool deviceAlive = true);
 

@@ -8,6 +8,7 @@
 #include <dlssnr/DlssNr_Capture.h>
 #include <dlssnr/DlssNr_Proxy.h>
 #include <dlssnr/DlssNr_ExposureScan.h>
+#include <dlssnr/DlssNr_Models.h>
 
 #include "DlssNr_Dx12.h"
 
@@ -181,6 +182,10 @@ struct NrState
     int* lastInit = nullptr;
     int* lastCreate = nullptr;
 
+    // Set by a forwarder that can hold more than one model at once. Absent on an older one, which
+    // keeps the first model it loads for the whole session.
+    const int* multiModel = nullptr;
+
     NVSDK_NGX_Parameter* capabilityParams = nullptr;
     void* feature = nullptr;
 
@@ -198,6 +203,20 @@ struct NrState
     // Indexed by pass, so [0] is unused and the first extra pass is [1]. Wasting one pointer keeps
     // every index here equal to the pass number it belongs to.
     void* passFeature[4] = {};
+
+    // Whether each extra pass's feature has been asked for since the main one was built, so one that
+    // would not build is not asked for again every frame -- a create per frame is what exhausts the
+    // driver's latches. And whether it has yet to evaluate: a new feature starts with no history.
+    bool passTried[4] = {};
+    bool passFresh[4] = {};
+
+    // Where every pass but the last writes. The passes alternate between this and output so none reads
+    // the surface it writes, and the last always lands in output, so everything after the model sees
+    // what it saw with one pass. Only allocated while more than one pass is asked for.
+    ID3D12Resource* passOutput = nullptr;
+
+    // How many passes the last frame ran, for the menu.
+    unsigned int lastPasses = 0;
 
     // The model cannot read and write one resource, so the frame is staged through these.
     ID3D12Resource* colorCopy = nullptr;
@@ -340,6 +359,12 @@ struct NrState
     bool builtAutoMask = false;
     unsigned long long settledAt = 0;
 
+    // The model file the live features were built from, and its version, for the menu. firstModel is
+    // the first file handed to the forwarder this session -- the one an older forwarder keeps for good.
+    std::filesystem::path builtModel;
+    std::string builtModelVersion;
+    std::filesystem::path firstModel;
+
     // Once something fails there is no recovering it mid-session, and retrying every frame turns a
     // failure into a crash. It stays off and says why.
     bool failed = false;
@@ -443,6 +468,35 @@ float WhitePointForMean(float meanLuma)
 
 std::filesystem::path g_dllDir;
 
+// Three is where re-feeding stops doing anything visible: each pass moves the picture less than the
+// last, and a fourth pays a whole model run for almost nothing. passFeature has room for one more.
+constexpr unsigned int kMaxPasses = 3;
+
+// The passes asked for, as this pass can run them. The proxy path evaluates through the driver and has
+// no feature of ours to hand a second pass to, so it is always one there.
+unsigned int WantedPasses(const Config& cfg)
+{
+    if (cfg.DlssNrUseProxy.value_or_default())
+        return 1;
+
+    return std::clamp(cfg.DlssNrPasses.value_or_default(), 1u, kMaxPasses);
+}
+
+bool ForwarderSwitchesModelsLive() { return g_nr.multiModel != nullptr && *g_nr.multiModel == 1; }
+
+// The model file this frame should run.
+//
+// An older forwarder keeps the first model it loads and ignores the path on every call after that, so
+// asking it for another would build the old model under the new one's name. Through one of those the
+// first model stands until a restart, and the menu says so.
+std::optional<std::filesystem::path> WantedModel(const Config& cfg)
+{
+    if (!g_nr.firstModel.empty() && !ForwarderSwitchesModelsLive())
+        return g_nr.firstModel;
+
+    return DlssNr::Models::Resolve(cfg.DlssNrModel.value_or_default());
+}
+
 // Loads the forwarder that owns the calls into the snippet.
 bool EnsureForwarder()
 {
@@ -492,6 +546,7 @@ bool EnsureForwarder()
     g_nr.probeFloat = (PFN_NrProbeFloat) GetProcAddress(g_nr.forwarder, "dlssnr_call_probe_float");
     g_nr.lastInit = (int*) GetProcAddress(g_nr.forwarder, "dlssnr_call_last_init");
     g_nr.lastCreate = (int*) GetProcAddress(g_nr.forwarder, "dlssnr_call_last_create");
+    g_nr.multiModel = (const int*) GetProcAddress(g_nr.forwarder, "dlssnr_multi_model");
 
     if (g_nr.create == nullptr || g_nr.evaluate == nullptr)
     {
@@ -499,7 +554,8 @@ bool EnsureForwarder()
         return false;
     }
 
-    LOG_INFO("DLSS-NR forwarder loaded from {}", path.string());
+    LOG_INFO("DLSS-NR forwarder loaded from {}{}", path.string(),
+             ForwarderSwitchesModelsLive() ? "" : " (an older build: a model change needs a restart)");
     return true;
 }
 
@@ -558,13 +614,15 @@ void ReportScalingRatios()
     if (g_nr.queryRatio == nullptr || g_nr.capabilityParams == nullptr)
         return;
 
-    auto snippet = Util::FindFilePath(g_dllDir, "nvngx_dlssnr.dll");
-
-    if (!snippet.has_value())
-        snippet = Util::FindFilePath(Util::ExePath().remove_filename(), "nvngx_dlssnr.dll");
+    // The model that will be built, because asking loads it -- and an older forwarder keeps whichever
+    // it loads first.
+    const auto snippet = WantedModel(*Config::Instance());
 
     if (!snippet.has_value())
         return;
+
+    if (g_nr.firstModel.empty())
+        g_nr.firstModel = *snippet;
 
     static const char* kNames[] = { "MaxPerf",         "Balanced",    "MaxQuality",
                                     "UltraPerformance", "UltraQuality", "DLAA" };
@@ -725,8 +783,7 @@ void ReleaseSurfacesIfFormatChanged(DXGI_FORMAT needed)
     for (void*& f : g_nr.passFeature)
         ParkNrFeature(f);
 
-    for (ID3D12Resource** r :
-         { &g_nr.output, &g_nr.colorCopy, &g_nr.hdrCopy, &g_nr.colorSmall })
+    for (ID3D12Resource** r : { &g_nr.output, &g_nr.colorCopy, &g_nr.hdrCopy, &g_nr.colorSmall, &g_nr.passOutput })
         ParkNrResource(*r);
 
     g_nr.reset = true;
@@ -1308,6 +1365,46 @@ void RecordBuiltTuning(const Config& cfg)
     g_nr.builtAutoMask = cfg.DlssNrAutoMask.value_or_default();
 }
 
+// Builds the feature for each extra pass that is asked for and does not have one yet, and says whether
+// it tried to build any. A frame that builds one must not evaluate: that is the rule the main feature
+// keeps, and breaking it is what got multi-pass removed the first time -- it built a pass's feature and
+// ran it on one command list in one frame, and the GPU hung on creation frames.
+//
+// Each is built exactly as the main feature was and from the same model, except that local tone is
+// zero. Tone is a look, and a look is applied once, by the first pass: handing it to every pass
+// re-graded an already graded picture, stacking warmth and contrast while the detail -- the thing worth
+// repeating -- did not compound.
+bool BuildPassFeatures(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList, const Config& cfg,
+                       unsigned int workWidth, unsigned int workHeight, unsigned int wantPasses)
+{
+    bool attempted = false;
+
+    for (unsigned int i = 1; i < wantPasses; ++i)
+    {
+        if (g_nr.passFeature[i] != nullptr || g_nr.passTried[i])
+            continue;
+
+        // Counted as built whether or not it succeeds: a create that fails part way may still have
+        // recorded into the list.
+        g_nr.passTried[i] = true;
+        attempted = true;
+
+        SetExtras(cfg, nullptr, nullptr, 0, 0, 0, 0);
+        g_nr.passFeature[i] =
+            g_nr.create(g_nr.builtModel.wstring().c_str(), State::Instance().NVNGX_ApplicationDataPath.c_str(), device,
+                        cmdList, g_nr.capabilityParams, workWidth, workHeight,
+                        (int) cfg.DlssNrPreset.value_or_default(), cfg.DlssNrIntensity.value_or_default(),
+                        (int) cfg.DlssNrStyle.value_or_default(), cfg.DlssNrLocalStructure.value_or_default(), 0.0f,
+                        cfg.DlssNrSkinStructure.value_or_default(), cfg.DlssNrAutoMask.value_or_default() ? 1 : 0, 1);
+        g_nr.passFresh[i] = true;
+
+        LOG_INFO("DLSS-NR: feature for pass {} {}", i + 1,
+                 g_nr.passFeature[i] != nullptr ? "built" : "would not build; running fewer passes");
+    }
+
+    return attempted;
+}
+
 // Guards the module's state. Every caller is now on the game's render thread, so this is no longer
 // holding two threads apart -- but the D3D11-on-D3D12 bridge enters from its own call site, and the
 // cost is a CPU-side lock on a path that already records command lists.
@@ -1670,8 +1767,18 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     // else -- a resolution change -- happened to force a rebuild by accident.
     const bool tuningChanged = !TuningMatchesFeature(cfg);
 
-    if (g_nr.feature != nullptr && (resolutionChanged || tuningChanged))
+    // A different model is a different feature, built by a different DLL. Rebuilt the same way, so a
+    // switch costs what a tuning change does: one frame without the model, and the old features parked
+    // until the GPU is past them.
+    const std::optional<std::filesystem::path> model = WantedModel(cfg);
+    const bool modelChanged = model.has_value() && *model != g_nr.builtModel;
+
+    if (g_nr.feature != nullptr && (resolutionChanged || tuningChanged || modelChanged))
     {
+        if (modelChanged)
+            LOG_INFO("DLSS-NR switching model: {} -> {}", wstring_to_string(g_nr.builtModel.wstring()),
+                     wstring_to_string(model->wstring()));
+
         // Parked rather than released: with frame generation the GPU can still be several frames
         // deep in work that references all of it.
         ParkNrFeature(g_nr.feature);
@@ -1688,6 +1795,7 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             ParkNrResource(g_nr.hdrCopy);
             ParkNrResource(g_nr.colorSmall);
             ParkNrResource(g_nr.outputNative);
+            ParkNrResource(g_nr.passOutput);
         }
     }
 
@@ -1706,6 +1814,15 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     // The down-leg target is native (the answer is brought back to frame size before the resolve).
     if (workScale > 1.0f && g_nr.outputNative == nullptr)
         g_nr.outputNative = CreateScratch(device, desc.Format, width, height);
+
+    // The second surface the passes alternate through, held only while more than one is asked for, so
+    // somebody who lowers the count gets the memory back.
+    const unsigned int wantPasses = WantedPasses(cfg);
+
+    if (wantPasses > 1 && g_nr.passOutput == nullptr)
+        g_nr.passOutput = CreateScratch(device, desc.Format, workWidth, workHeight);
+    else if (wantPasses == 1 && g_nr.passOutput != nullptr)
+        ParkNrResource(g_nr.passOutput);
 
     if (g_nr.meter == nullptr)
     {
@@ -1743,10 +1860,8 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     if (g_nr.feature == nullptr && g_nr.output != nullptr && g_nr.colorCopy != nullptr &&
         g_nr.hdrCopy != nullptr)
     {
-        auto snippet = Util::FindFilePath(g_dllDir, "nvngx_dlssnr.dll");
-
-        if (!snippet.has_value())
-            snippet = Util::FindFilePath(Util::ExePath().remove_filename(), "nvngx_dlssnr.dll");
+        // The model chosen in the menu, or nvngx_dlssnr.dll found exactly as it always was.
+        const auto& snippet = model;
 
         if (!snippet.has_value())
         {
@@ -1756,6 +1871,9 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
             device->Release();
             return;
         }
+
+        if (g_nr.firstModel.empty())
+            g_nr.firstModel = *snippet;
 
         SetExtras(cfg, nullptr, nullptr, 0, 0, 0, 0);
         g_nr.feature =
@@ -1773,7 +1891,10 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         if (g_nr.feature == nullptr)
         {
             g_nr.failed = true;
-            g_nr.reason = "the model would not initialise";
+            // A chosen model that will not build is the user's way back out, so the reason says so.
+            g_nr.reason = cfg.DlssNrModel.value_or_default().empty()
+                              ? "the model would not initialise"
+                              : "the chosen model would not initialise -- pick another under Model file, then Retry";
             const auto initResult = (unsigned int) (g_nr.lastInit != nullptr ? *g_nr.lastInit : 0);
             const auto createResult = (unsigned int) (g_nr.lastCreate != nullptr ? *g_nr.lastCreate : 0);
 
@@ -1788,9 +1909,20 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
         g_nr.width = width;
         g_nr.height = height;
         g_nr.reset = true;
+        g_nr.builtModel = *snippet;
+        g_nr.builtModelVersion = DlssNr::Models::VersionOf(*snippet);
         RecordBuiltTuning(cfg);
-        LOG_INFO("DLSS-NR running at {}x{}, guides {}x{} (preset {}, intensity {}, style {})", width,
-                 height, guideWidth, guideHeight, g_nr.builtPreset, g_nr.builtIntensity, g_nr.builtStyle);
+        LOG_INFO("DLSS-NR running at {}x{}, guides {}x{} (preset {}, intensity {}, style {}), model {} ({})", width,
+                 height, guideWidth, guideHeight, g_nr.builtPreset, g_nr.builtIntensity, g_nr.builtStyle,
+                 wstring_to_string(snippet->wstring()),
+                 g_nr.builtModelVersion.empty() ? "no version" : g_nr.builtModelVersion);
+
+        // The extra passes are built now as well, on the frame that already evaluates nothing, rather
+        // than costing a second frame without the model. Their old features went with the main one.
+        for (bool& tried : g_nr.passTried)
+            tried = false;
+
+        BuildPassFeatures(device, cmdList, cfg, workWidth, workHeight, g_nr.passOutput != nullptr ? wantPasses : 1);
 
         // Creating and evaluating a feature in the same command list is the dice-roll that hung the
         // GPU (every crash died on a creation frame). The creation goes through the game's own submit
@@ -1801,6 +1933,26 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
 
     if (g_nr.feature == nullptr)
     {
+        device->Release();
+        return;
+    }
+
+    // Fewer passes asked for: the extras go, parked like everything else the GPU may still be reading,
+    // and may be asked for again. More: their features are built on a frame of their own, before
+    // anything else is recorded, and run from the next one.
+    for (unsigned int i = wantPasses; i < kMaxPasses; ++i)
+    {
+        if (g_nr.passFeature[i] != nullptr)
+            LOG_INFO("DLSS-NR: releasing the feature for pass {}", i + 1);
+
+        ParkNrFeature(g_nr.passFeature[i]);
+        g_nr.passTried[i] = false;
+    }
+
+    // Not without the surface they alternate through: they could never run.
+    if (BuildPassFeatures(device, cmdList, cfg, workWidth, workHeight, g_nr.passOutput != nullptr ? wantPasses : 1))
+    {
+        Barrier(cmdList, target, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, outputArrival);
         device->Release();
         return;
     }
@@ -2183,16 +2335,83 @@ void DlssNr_Dx12::Dispatch(ID3D12GraphicsCommandList* cmdList, ID3D12Resource* c
     if (g_ngxTime != nullptr)
         g_ngxTime->Start(cmdList);
 
-    // Multi-pass was removed: re-feeding the model its own output re-opened the same-command-list
-    // feature-creation hang, and the colour core is not settled enough to build on. One evaluate.
-    const int result = g_nr.evaluate(
-        cmdList, g_nr.feature, g_nr.capabilityParams, modelInput, depthIn, motionIn, g_nr.output,
-        workWidth, workHeight, guideWidth, guideHeight, g_nr.guideDepthInverted ? 1 : 0,
-        g_nr.reset ? 1 : 0, cfg.DlssNrIntensity.value_or_default(),
-        (int) cfg.DlssNrStyle.value_or_default(), cfg.DlssNrLocalStructure.value_or_default(),
-        cfg.DlssNrLocalTone.value_or_default(), cfg.DlssNrSkinStructure.value_or_default(),
-        cfg.DlssNrAutoMask.value_or_default() ? 1 : 0, g_nr.guideMvScaleX * mvToWork,
-        g_nr.guideMvScaleY * mvToWork);
+    // The passes, each on a feature of its own and each fed the last one's answer.
+    //
+    // What can run: the first, then every extra pass whose feature exists, in order. One that would
+    // not build ends the chain there rather than being skipped over, and none of them runs on the
+    // frame its feature was built -- that frame returned above.
+    unsigned int passes = 1;
+
+    if (g_nr.passOutput != nullptr)
+    {
+        while (passes < wantPasses && g_nr.passFeature[passes] != nullptr)
+            ++passes;
+    }
+
+    if (passes != g_nr.lastPasses)
+        LOG_INFO("DLSS-NR: {} model pass{} per frame{}", passes, passes == 1 ? "" : "es",
+                 passes < wantPasses ? " -- fewer than asked for, because a pass could not be set up" : "");
+
+    g_nr.lastPasses = passes;
+
+    // The proxy stays as the encode left it. The resolve composes the final answer against the picture
+    // the model was first shown, so every pass's edit reaches the frame. Writing each answer back over
+    // the proxy, as multi-pass once did, left the resolve comparing the last pass with the one before
+    // it -- only the final increment was ever composed.
+    int result = NVSDK_NGX_Result_Success;
+    ID3D12Resource* passIn = modelInput;
+
+    for (unsigned int pass = 0; pass < passes; ++pass)
+    {
+        // The last pass lands in output, so the down-leg, the resolve and the capture below read what
+        // they read with one pass. The ones before it alternate so none writes what it reads.
+        ID3D12Resource* passOut = ((passes - 1 - pass) % 2 == 0) ? g_nr.output : g_nr.passOutput;
+        void* passFeature = pass == 0 ? g_nr.feature : g_nr.passFeature[pass];
+
+        // Reset belongs to the frame: a cut in the game resets every pass. A pass's first frame resets
+        // it as well, since its feature has no history yet. Tone belongs to the first pass, as at create.
+        const bool passReset = g_nr.reset || (pass > 0 && g_nr.passFresh[pass]);
+        const float passTone = pass == 0 ? cfg.DlssNrLocalTone.value_or_default() : 0.0f;
+
+        result =
+            g_nr.evaluate(cmdList, passFeature, g_nr.capabilityParams, passIn, depthIn, motionIn, passOut, workWidth,
+                          workHeight, guideWidth, guideHeight, g_nr.guideDepthInverted ? 1 : 0, passReset ? 1 : 0,
+                          cfg.DlssNrIntensity.value_or_default(), (int) cfg.DlssNrStyle.value_or_default(),
+                          cfg.DlssNrLocalStructure.value_or_default(), passTone,
+                          cfg.DlssNrSkinStructure.value_or_default(), cfg.DlssNrAutoMask.value_or_default() ? 1 : 0,
+                          g_nr.guideMvScaleX * mvToWork, g_nr.guideMvScaleY * mvToWork);
+
+        if (pass > 0)
+            g_nr.passFresh[pass] = false;
+
+        if (result != NVSDK_NGX_Result_Success)
+        {
+            if (pass > 0)
+                LOG_ERROR("DLSS-NR: pass {} of {} was refused", pass + 1, passes);
+
+            break;
+        }
+
+        if (pass + 1 < passes)
+        {
+            // This answer is the next pass's input. The transition doubles as the wait for its writes.
+            Barrier(cmdList, passOut, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+            // And what this pass read goes back to being something a pass writes -- unless it is the
+            // proxy, which the resolve still needs as it is.
+            if (passIn != modelInput)
+                Barrier(cmdList, passIn, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+            passIn = passOut;
+        }
+    }
+
+    // The last surface a pass read, back where the next frame expects it. With one pass this is the
+    // proxy and nothing is recorded.
+    if (passIn != modelInput)
+        Barrier(cmdList, passIn, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     if (g_ngxTime != nullptr)
         g_ngxTime->End(cmdList);
@@ -2462,10 +2681,39 @@ namespace DlssNr
 {
 void RetryAfterFailure()
 {
+    std::lock_guard<std::mutex> nrLock(g_nrMutex);
+
     g_nr.failed = false;
     g_nr.reason = "";
     g_nr.reset = true;
 
+    // A pass that would not build gets another try along with everything else.
+    for (bool& tried : g_nr.passTried)
+        tried = false;
+}
+
+unsigned int LastPasses() { return g_nr.lastPasses; }
+
+Models::Status ActiveModelStatus()
+{
+    std::lock_guard<std::mutex> nrLock(g_nrMutex);
+
+    Models::Status status;
+
+    if (g_nr.feature != nullptr && !g_nr.failed)
+    {
+        status.running = g_nr.builtModel;
+        status.version = g_nr.builtModelVersion;
+    }
+
+    // Only once something is loaded: before that, whatever is chosen is simply what loads first.
+    if (!g_nr.firstModel.empty() && !ForwarderSwitchesModelsLive())
+    {
+        const auto chosen = DlssNr::Models::Resolve(Config::Instance()->DlssNrModel.value_or_default());
+        status.needsRestart = chosen.has_value() && *chosen != g_nr.firstModel;
+    }
+
+    return status;
 }
 
 // Reads the game's parameter block and runs the pass on what it finds.
@@ -2869,6 +3117,19 @@ void Shutdown()
             g_nr.release(f);
 
         f = nullptr;
+    }
+
+    for (bool& tried : g_nr.passTried)
+        tried = false;
+
+    g_nr.lastPasses = 0;
+    g_nr.builtModel.clear();
+    g_nr.builtModelVersion.clear();
+
+    if (g_nr.passOutput != nullptr)
+    {
+        g_nr.passOutput->Release();
+        g_nr.passOutput = nullptr;
     }
 
     if (g_nr.output != nullptr)

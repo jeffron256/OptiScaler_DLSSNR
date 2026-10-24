@@ -14,6 +14,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d12.h>
+#include <wchar.h>
 
 namespace {
 
@@ -59,33 +60,143 @@ using PFN_NrCreate = int(__cdecl *)(ID3D12GraphicsCommandList *, int, const void
 using PFN_NrEvaluate = int(__cdecl *)(ID3D12GraphicsCommandList *, const void *, const void *, void *);
 using PFN_NrRelease = int(__cdecl *)(void *);
 
+// More than one model can be loaded at once.
+//
+// A newer nvngx_dlssnr.dll is a different model -- 310.9.16 is faster than 310.8 and does less -- and
+// the host lets one be chosen mid-session. So models are kept by path, a slot each. A model is never
+// unloaded: its features can still be in flight on the GPU when it stops being chosen, and NGX has no
+// shutdown that leaves the device's state alone. It stays resident until the process exits, which
+// also makes switching back to it free.
+constexpr int kMaxModels = 8;
+constexpr size_t kMaxPathChars = 1024;
+
+// Which model each live feature came from.
+//
+// A feature belongs to the DLL that created it and has to be evaluated and released by that one,
+// never by whichever was loaded last. The evaluate and release exports take only the feature, so the
+// pairing is kept here.
+//
+// Sized well past anything reachable: the host parks a retired feature for 32 frames before releasing
+// it and rebuilds at most once a frame, a few features at a time. Were it ever full, a feature falls
+// back to the most recent model, which is what every feature did before there could be two.
+struct FeatureOwners {
+    static constexpr int kCapacity = 256;
+
+    struct Entry {
+        void *feature = nullptr;
+        void *owner = nullptr;
+    };
+
+    Entry entries[kCapacity] = {};
+
+    void remember(void *feature, void *owner) {
+        // A handle the driver hands out again after a device change abandoned the first one.
+        for (auto &e : entries) {
+            if (e.feature == feature) {
+                e.owner = owner;
+                return;
+            }
+        }
+
+        for (auto &e : entries) {
+            if (e.feature == nullptr) {
+                e.feature = feature;
+                e.owner = owner;
+                return;
+            }
+        }
+    }
+
+    void *find(void *feature) const {
+        for (const auto &e : entries) {
+            if (e.feature == feature) {
+                return e.owner;
+            }
+        }
+
+        return nullptr;
+    }
+
+    void forget(void *feature) {
+        for (auto &e : entries) {
+            if (e.feature == feature) {
+                e = Entry {};
+                return;
+            }
+        }
+    }
+};
+
 struct Snippet {
+    wchar_t path[kMaxPathChars] = {};
     HMODULE module = nullptr;
     PFN_NrInitExt init = nullptr;
     PFN_NrCreate create = nullptr;
     PFN_NrEvaluate evaluate = nullptr;
     PFN_NrRelease release = nullptr;
     bool initialised = false;
-
 };
 
-Snippet g_snip;
+Snippet g_snips[kMaxModels];
+FeatureOwners g_owners;
 
-bool loadSnippet(const wchar_t *path) {
-    if (g_snip.module) {
-        return g_snip.create != nullptr;
+// The model the last feature was created from: where a feature with no recorded owner goes.
+Snippet *g_lastSnippet = nullptr;
+
+// The model at this path, loaded into a free slot if it is not already. Null when it will not load,
+// when it lacks the entry points every caller needs, or when every slot is taken.
+Snippet *loadSnippet(const wchar_t *path) {
+    if (path == nullptr) {
+        return nullptr;
     }
-    g_snip.module = LoadLibraryExW(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-    if (!g_snip.module) {
-        return false;
+
+    for (auto &s : g_snips) {
+        if (s.module != nullptr && _wcsicmp(s.path, path) == 0) {
+            return s.create != nullptr && s.evaluate != nullptr ? &s : nullptr;
+        }
     }
-    g_snip.init = (PFN_NrInitExt) GetProcAddress(g_snip.module, "NVSDK_NGX_D3D12_Init_Ext");
-    g_snip.create = (PFN_NrCreate) GetProcAddress(g_snip.module, "NVSDK_NGX_D3D12_CreateFeature");
-    g_snip.evaluate = (PFN_NrEvaluate) GetProcAddress(g_snip.module, "NVSDK_NGX_D3D12_EvaluateFeature");
-    g_snip.release = (PFN_NrRelease) GetProcAddress(g_snip.module, "NVSDK_NGX_D3D12_ReleaseFeature");
 
+    if (wcslen(path) >= kMaxPathChars) {
+        return nullptr;
+    }
 
-    return g_snip.create != nullptr && g_snip.evaluate != nullptr;
+    for (auto &s : g_snips) {
+        if (s.module != nullptr) {
+            continue;
+        }
+
+        HMODULE module = LoadLibraryExW(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+
+        if (!module) {
+            return nullptr;
+        }
+
+        // The same file under a second spelling of its path. Windows hands back the module already
+        // loaded, and a second slot for it would initialise one NGX core twice.
+        for (auto &other : g_snips) {
+            if (other.module == module) {
+                FreeLibrary(module);
+                return other.create != nullptr && other.evaluate != nullptr ? &other : nullptr;
+            }
+        }
+
+        wcscpy_s(s.path, path);
+        s.module = module;
+        s.init = (PFN_NrInitExt) GetProcAddress(s.module, "NVSDK_NGX_D3D12_Init_Ext");
+        s.create = (PFN_NrCreate) GetProcAddress(s.module, "NVSDK_NGX_D3D12_CreateFeature");
+        s.evaluate = (PFN_NrEvaluate) GetProcAddress(s.module, "NVSDK_NGX_D3D12_EvaluateFeature");
+        s.release = (PFN_NrRelease) GetProcAddress(s.module, "NVSDK_NGX_D3D12_ReleaseFeature");
+
+        return s.create != nullptr && s.evaluate != nullptr ? &s : nullptr;
+    }
+
+    return nullptr;
+}
+
+// The model a feature belongs to.
+Snippet *ownerOf(void *feature) {
+    auto *owner = static_cast<Snippet *>(g_owners.find(feature));
+    return owner != nullptr ? owner : g_lastSnippet;
 }
 
 
@@ -114,6 +225,11 @@ __declspec(dllexport) void dlssnr_call_probe_float(void *params, const char *nam
 __declspec(dllexport) int dlssnr_call_last_init = 0;
 __declspec(dllexport) int dlssnr_call_last_create = 0;
 
+// Present in the build that can hold more than one model at a time. The host reads it before switching
+// models mid-session: an older forwarder keeps the first model it loads and ignores the path on every
+// call after, so switching through one would build the old model under the new one's name.
+__declspec(dllexport) int dlssnr_multi_model = 1;
+
 // ---------------------------------------------------------------------------------------------
 // Vulkan.
 //
@@ -137,7 +253,9 @@ using PFN_NrVkInitExt = int(__cdecl *)(unsigned long long, const wchar_t *, void
 using PFN_NrVkCreate = int(__cdecl *)(void *, int, const void *, void **);
 using PFN_NrVkEvaluate = int(__cdecl *)(void *, const void *, const void *, void *);
 
+// A slot per model, the same as the D3D12 side and for the same reasons.
 struct VkSnippet {
+    wchar_t path[kMaxPathChars] = {};
     HMODULE module = nullptr;
     PFN_NrVkInitExt init = nullptr;
     PFN_NrVkCreate create = nullptr;
@@ -146,25 +264,68 @@ struct VkSnippet {
     bool initialised = false;
 };
 
-VkSnippet g_vk;
+VkSnippet g_vkSnips[kMaxModels];
+FeatureOwners g_vkOwners;
 
-bool loadVkSnippet(const wchar_t *path) {
-    if (g_vk.module) {
-        return g_vk.create != nullptr;
+// The model the host last initialised. Create takes no path on this API, so this is the one it means.
+VkSnippet *g_vkCurrent = nullptr;
+
+// The slot for the model at this path, loaded if it is not already -- complete or not, because the
+// probe reports which entry points are missing rather than refusing to look.
+VkSnippet *vkSlot(const wchar_t *path) {
+    if (path == nullptr) {
+        return nullptr;
     }
 
-    g_vk.module = LoadLibraryExW(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
-
-    if (!g_vk.module) {
-        return false;
+    for (auto &s : g_vkSnips) {
+        if (s.module != nullptr && _wcsicmp(s.path, path) == 0) {
+            return &s;
+        }
     }
 
-    g_vk.init = (PFN_NrVkInitExt) GetProcAddress(g_vk.module, "NVSDK_NGX_VULKAN_Init_Ext");
-    g_vk.create = (PFN_NrVkCreate) GetProcAddress(g_vk.module, "NVSDK_NGX_VULKAN_CreateFeature");
-    g_vk.evaluate = (PFN_NrVkEvaluate) GetProcAddress(g_vk.module, "NVSDK_NGX_VULKAN_EvaluateFeature");
-    g_vk.release = (PFN_NrRelease) GetProcAddress(g_vk.module, "NVSDK_NGX_VULKAN_ReleaseFeature");
+    if (wcslen(path) >= kMaxPathChars) {
+        return nullptr;
+    }
 
-    return g_vk.create != nullptr && g_vk.evaluate != nullptr;
+    for (auto &s : g_vkSnips) {
+        if (s.module != nullptr) {
+            continue;
+        }
+
+        HMODULE module = LoadLibraryExW(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+
+        if (!module) {
+            return nullptr;
+        }
+
+        for (auto &other : g_vkSnips) {
+            if (other.module == module) {
+                FreeLibrary(module);
+                return &other;
+            }
+        }
+
+        wcscpy_s(s.path, path);
+        s.module = module;
+        s.init = (PFN_NrVkInitExt) GetProcAddress(s.module, "NVSDK_NGX_VULKAN_Init_Ext");
+        s.create = (PFN_NrVkCreate) GetProcAddress(s.module, "NVSDK_NGX_VULKAN_CreateFeature");
+        s.evaluate = (PFN_NrVkEvaluate) GetProcAddress(s.module, "NVSDK_NGX_VULKAN_EvaluateFeature");
+        s.release = (PFN_NrRelease) GetProcAddress(s.module, "NVSDK_NGX_VULKAN_ReleaseFeature");
+
+        return &s;
+    }
+
+    return nullptr;
+}
+
+VkSnippet *loadVkSnippet(const wchar_t *path) {
+    VkSnippet *s = vkSlot(path);
+    return s != nullptr && s->create != nullptr && s->evaluate != nullptr ? s : nullptr;
+}
+
+VkSnippet *vkOwnerOf(void *feature) {
+    auto *owner = static_cast<VkSnippet *>(g_vkOwners.find(feature));
+    return owner != nullptr ? owner : g_vkCurrent;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -209,14 +370,16 @@ __declspec(dllexport) int dlssnr_query_scaling_ratio(const wchar_t *snippetPath,
                                                      unsigned int perfQuality, float *outRatio) {
     dlssnr_last_ratio_stage = 0;
 
-    if (!loadSnippet(snippetPath) || !capabilityParams || !outRatio) {
+    Snippet *snip = loadSnippet(snippetPath);
+
+    if (!snip || !capabilityParams || !outRatio) {
         return 0;
     }
 
     dlssnr_last_ratio_stage = 1;
 
     // Publishing is what puts the callback in the block. Harmless if it has already happened.
-    auto populate = (PFN_NrPopulate) GetProcAddress(g_snip.module, "NVSDK_NGX_D3D12_PopulateParameters_Impl");
+    auto populate = (PFN_NrPopulate) GetProcAddress(snip->module, "NVSDK_NGX_D3D12_PopulateParameters_Impl");
 
     if (populate != nullptr) {
         volatile int populated = populate(capabilityParams);
@@ -466,15 +629,16 @@ __declspec(dllexport) int dlssnr_d3d11_init(const wchar_t *snippetPath, const wc
     }
 
     const bool haveCopy = loadD3D11Snippet(snippetPath);
-    const bool haveShared = loadSnippet(snippetPath);
+    Snippet *shared = loadSnippet(snippetPath);
+    const bool haveShared = shared != nullptr;
 
     struct Attempt { HMODULE module; bool ext; };
 
     const Attempt attempts[4] = {
         { haveCopy ? g_d3d11.module : nullptr, true },
         { haveCopy ? g_d3d11.module : nullptr, false },
-        { haveShared ? g_snip.module : nullptr, true },
-        { haveShared ? g_snip.module : nullptr, false },
+        { haveShared ? shared->module : nullptr, true },
+        { haveShared ? shared->module : nullptr, false },
     };
 
     int last = -1;
@@ -582,13 +746,17 @@ __declspec(dllexport) int dlssnr_vk_last_create = 0;
 // 15 means the model's Vulkan surface is entirely reachable from here. Answered without creating
 // anything, so the host can decide whether the native path exists before committing to it.
 __declspec(dllexport) int dlssnr_vk_probe(const wchar_t *snippetPath) {
-    loadVkSnippet(snippetPath);
+    const VkSnippet *s = vkSlot(snippetPath);
+
+    if (s == nullptr) {
+        return 0;
+    }
 
     int bits = 0;
-    bits |= g_vk.init != nullptr ? 1 : 0;
-    bits |= g_vk.create != nullptr ? 2 : 0;
-    bits |= g_vk.evaluate != nullptr ? 4 : 0;
-    bits |= g_vk.release != nullptr ? 8 : 0;
+    bits |= s->init != nullptr ? 1 : 0;
+    bits |= s->create != nullptr ? 2 : 0;
+    bits |= s->evaluate != nullptr ? 4 : 0;
+    bits |= s->release != nullptr ? 8 : 0;
 
     return bits;
 }
@@ -596,21 +764,29 @@ __declspec(dllexport) int dlssnr_vk_probe(const wchar_t *snippetPath) {
 __declspec(dllexport) int dlssnr_vk_init(const wchar_t *snippetPath, const wchar_t *dataPath,
                                          void *instance, void *physicalDevice, void *device,
                                          int sdkVersion) {
-    if (!loadVkSnippet(snippetPath) || g_vk.init == nullptr) {
+    VkSnippet *s = loadVkSnippet(snippetPath);
+
+    if (s == nullptr || s->init == nullptr) {
         return -1;
     }
 
-    if (g_vk.initialised) {
+    // Initialising a model is also choosing it: create, which takes no path, builds from this one.
+    if (s->initialised) {
+        g_vkCurrent = s;
         return 1;
     }
 
     // Assigned rather than returned directly. A tail call becomes a jmp, and the snippet resolves its
     // caller from the return address -- so tail calling hands it whoever called this instead of this
     // module, and the caller gate rejects it before a single argument is read.
-    volatile int result = g_vk.init(0x0, dataPath, instance, physicalDevice, device, nullptr, sdkVersion);
+    volatile int result = s->init(0x0, dataPath, instance, physicalDevice, device, nullptr, sdkVersion);
 
     dlssnr_vk_last_init = (int) result;
-    g_vk.initialised = result == 1;
+    s->initialised = result == 1;
+
+    if (s->initialised) {
+        g_vkCurrent = s;
+    }
 
     return (int) result;
 }
@@ -627,7 +803,9 @@ __declspec(dllexport) void *dlssnr_vk_create(void *cmdBuffer, void *capabilityPa
                                              unsigned int height, int preset, float intensity, int style,
                                              float localStructure, float localTone, float skinStructure,
                                              int useAutoMask, int uiCorrection) {
-    if (g_vk.create == nullptr || cmdBuffer == nullptr || capabilityParams == nullptr) {
+    VkSnippet *s = g_vkCurrent;
+
+    if (s == nullptr || s->create == nullptr || cmdBuffer == nullptr || capabilityParams == nullptr) {
         return nullptr;
     }
 
@@ -650,9 +828,13 @@ __declspec(dllexport) void *dlssnr_vk_create(void *cmdBuffer, void *capabilityPa
     setUInt(capabilityParams, "DLSSNR.UICorrection", (unsigned int) uiCorrection);
 
     void *feature = nullptr;
-    volatile int result = g_vk.create(cmdBuffer, 18, capabilityParams, &feature);
+    volatile int result = s->create(cmdBuffer, 18, capabilityParams, &feature);
 
     dlssnr_vk_last_create = (int) result;
+
+    if (result == 1 && feature != nullptr) {
+        g_vkOwners.remember(feature, s);
+    }
 
     return result == 1 ? feature : nullptr;
 }
@@ -671,7 +853,9 @@ __declspec(dllexport) int dlssnr_vk_evaluate(void *cmdBuffer, void *feature, voi
                                              int depthInverted, int reset, float intensity, int style,
                                              float localStructure, float localTone, float skinStructure,
                                              int useAutoMask, float mvScaleX, float mvScaleY) {
-    if (g_vk.evaluate == nullptr || feature == nullptr || capabilityParams == nullptr) {
+    VkSnippet *s = vkOwnerOf(feature);
+
+    if (s == nullptr || s->evaluate == nullptr || feature == nullptr || capabilityParams == nullptr) {
         return -1;
     }
 
@@ -719,14 +903,17 @@ __declspec(dllexport) int dlssnr_vk_evaluate(void *cmdBuffer, void *feature, voi
 
     // Assigned rather than returned. A tail call becomes a jmp and the snippet would resolve its
     // caller past this module, which the gate rejects.
-    volatile int result = g_vk.evaluate(cmdBuffer, feature, capabilityParams, nullptr);
+    volatile int result = s->evaluate(cmdBuffer, feature, capabilityParams, nullptr);
 
     return (int) result;
 }
 
 __declspec(dllexport) void dlssnr_vk_release(void *feature) {
-    if (g_vk.release != nullptr && feature != nullptr) {
-        volatile int ignored = g_vk.release(feature);
+    VkSnippet *s = vkOwnerOf(feature);
+    g_vkOwners.forget(feature);
+
+    if (s != nullptr && s->release != nullptr && feature != nullptr) {
+        volatile int ignored = s->release(feature);
         (void) ignored;
     }
 }
@@ -740,16 +927,17 @@ __declspec(dllexport) void *dlssnr_call_create(const wchar_t *snippetPath, const
                                                int style, float localStructure, float localTone,
                                                float skinStructure, int useAutoMask,
                                                int uiCorrection) {
-    if (!loadSnippet(snippetPath) || !capabilityParams) {
+    Snippet *snip = loadSnippet(snippetPath);
+    if (!snip || !capabilityParams) {
         return nullptr;
     }
-    if (!g_snip.initialised && g_snip.init) {
+    if (!snip->initialised && snip->init) {
         // OptiScaler's own generic application id, the one it already hands DLSS when a game's id is
         // not wanted. What was here before was 0x4350324B -- "CP2K" -- so every game that ever loaded
         // this announced itself to the driver as Cyberpunk 2077.
-        dlssnr_call_last_init = g_snip.init(0x24480451ull, dataPath, device, 0x0000015, capabilityParams);
-        g_snip.initialised = (dlssnr_call_last_init == 1);
-        if (!g_snip.initialised) {
+        dlssnr_call_last_init = snip->init(0x24480451ull, dataPath, device, 0x0000015, capabilityParams);
+        snip->initialised = (dlssnr_call_last_init == 1);
+        if (!snip->initialised) {
             return nullptr;
         }
     }
@@ -774,7 +962,11 @@ __declspec(dllexport) void *dlssnr_call_create(const wchar_t *snippetPath, const
     setUInt(capabilityParams, "DLSSNR.UseAutoMask", (unsigned int) useAutoMask);
     setUInt(capabilityParams, "DLSSNR.UICorrection", (unsigned int) uiCorrection);
     void *handle = nullptr;
-    dlssnr_call_last_create = g_snip.create(cmd, 18, capabilityParams, &handle);
+    dlssnr_call_last_create = snip->create(cmd, 18, capabilityParams, &handle);
+    if (handle) {
+        g_owners.remember(handle, snip);
+        g_lastSnippet = snip;
+    }
     return handle;
 }
 
@@ -789,7 +981,8 @@ __declspec(dllexport) int dlssnr_call_evaluate(ID3D12GraphicsCommandList *cmd, v
                                                float intensity, int style, float localStructure,
                                                float localTone, float skinStructure, int useAutoMask,
                                                float mvScaleX, float mvScaleY) {
-    if (!feature || !capabilityParams || !g_snip.evaluate) {
+    Snippet *snip = ownerOf(feature);
+    if (!feature || !capabilityParams || !snip || !snip->evaluate) {
         return 0;
     }
     setResource(capabilityParams, "DLSSNR.Color", color);
@@ -839,7 +1032,7 @@ __declspec(dllexport) int dlssnr_call_evaluate(ID3D12GraphicsCommandList *cmd, v
     // jmp rather than a call, which leaves this module's frame behind: the snippet then resolves its
     // caller to whoever called us and rejects it. Keeping the value in a volatile forces a real call and
     // a return through this module, which is the whole reason this file exists.
-    volatile int result = g_snip.evaluate(cmd, feature, capabilityParams, nullptr);
+    volatile int result = snip->evaluate(cmd, feature, capabilityParams, nullptr);
     return result;
 }
 
@@ -880,8 +1073,10 @@ __declspec(dllexport) void dlssnr_call_set_extras(void *capabilityParams, float 
 }
 
 __declspec(dllexport) void dlssnr_call_release(void *feature) {
-    if (feature && g_snip.release) {
-        volatile int result = g_snip.release(feature); // not a tail call, for the reason above
+    Snippet *snip = ownerOf(feature);
+    g_owners.forget(feature);
+    if (feature && snip && snip->release) {
+        volatile int result = snip->release(feature); // not a tail call, for the reason above
         (void) result;
     }
 }

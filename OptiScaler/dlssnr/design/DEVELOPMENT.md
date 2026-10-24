@@ -65,6 +65,20 @@ exactly 1 anchor (direction is in the data at ≥2). Paper white shows only to s
 to edit a selected row; in the steady state (≥1 anchor, none selected) it is hidden and Anchor captures
 the trimmed effective white instead.
 
+### 2.2 Cost and Model menu (`DlssNr_Menu.cpp`)
+
+| Control | Shown when | Notes |
+|---------|-----------|-------|
+| **Passes** slider (1-3) | always | committed on release; green 1, amber 2, red 3 |
+| Running line `, N passes` | N > 1 passes actually ran | the count that ran, not the one asked for |
+| **Model file** combo | 2+ models found, or the choice is not the one listed model | selecting writes `DlssNrModel` = that entry's id; preview says `(missing)` only when the choice resolves to nothing |
+| `Model file: <name>` text | exactly 1 model found and it is the choice | nothing to switch to, so not a control |
+| amber "No nvngx_dlssnr.dll found" | 0 models found | |
+| **Rescan** button | always | looks on disk again |
+| amber "`<id>` was not found" | the stored id resolves to nothing | the default is in use |
+| amber "Takes effect after a restart" | something is loaded, the forwarder lacks `dlssnr_multi_model`, and the choice differs from the first model loaded | |
+| grey "In use: `<version>`" | a feature is running | |
+
 ---
 
 ## 3. Per-change-type review (run BEFORE deploy)

@@ -48,6 +48,7 @@ experiment.
 | `DlssNrFeature_Dx12.h` | the namespace-level API the menu and the call sites use |
 | `DlssNr_Menu.cpp` | the settings panel |
 | `DlssNr_Capture.h` | matched before/after frame dumps |
+| `DlssNr_Models.h/.cpp` | which `nvngx_dlssnr.dll` to load: discovery, the menu's list, resolving the `[DlssNr] Model` choice |
 | `DlssNr_Proxy.h/.cpp` | the experiment in reaching the model through the driver core instead of the forwarder; see `FORWARDER_INVESTIGATION.md` |
 | `forwarder/` | the caller-gate shim, built by `dlssnr_forwarder.vcxproj` into the release layout |
 | `shaders/dlssnr/DlssNr_Dx12.h/.cpp` | the pass: forwarder loading, feature lifetime, the evaluate path, encode/resolve orchestration, capture |
@@ -86,6 +87,41 @@ The model's snippet resolves the module that owns its caller's return address an
 path does not contain `nvngx.dll`. The forwarder (`nvngx.dll_dlssnr.dll`, ~13 KB) exists only to
 satisfy that check; every NGX call to the model originates from it. It contains no NVIDIA code, is
 part of the solution, and builds with everything else.
+
+## Choosing a model
+
+A newer `nvngx_dlssnr.dll` is a different model: 310.9.16 (from an NBA 2K27 update) is reported as
+roughly twice as fast as the 310.8 builds and visibly does less. Either can be chosen under **Model
+file** in the menu, live, without swapping files between sessions. Extra copies are found beside
+OptiScaler or the game as `DlssNrModels\<any name>\nvngx_dlssnr.dll` (the original file name, which is
+the safer layout) or as a renamed `nvngx_dlssnr*.dll`. `[DlssNr] Model` stores the choice relative to
+the folder it was found in; empty is `nvngx_dlssnr.dll` found exactly as before.
+
+A switch is a rebuild like any tuning change. It needs this build's forwarder: an older
+`nvngx.dll_dlssnr.dll` keeps the first model it loads and ignores the path after that, so OptiScaler
+checks for the forwarder's `dlssnr_multi_model` export and, without it, applies a choice only at the next
+launch (the menu says so). The new forwarder keeps a slot per model and remembers which DLL created each
+feature, because a feature must be evaluated and released by its own DLL. A model is never unloaded --
+its features may still be in flight -- so it stays resident until exit.
+
+## Multi-pass
+
+**Passes** (1-3, default 1) runs the model again on its own answer. Three things make it work where the
+removed version did not:
+
+- **A feature per pass**, each with its own temporal history. One feature evaluated three times a frame
+  is told three frames passed with no motion, so its history fights every pass after the first.
+- **Built a frame ahead.** A frame that builds a pass's feature evaluates nothing (D3D12) or does not run
+  that pass (Vulkan) -- the rule the main feature keeps. The old code built and ran a pass's feature on
+  one command list in one frame, which is the creation-frame GPU hang.
+- **The proxy is left alone.** Passes alternate between `output` and a second surface, and the last
+  always lands in `output`, so the resolve composes the *final* answer against the picture the model was
+  *first* shown. The old code copied each answer back over the proxy, so the resolve only ever composed
+  the last pass's increment over the one before it.
+
+Local tone goes to the first pass only, at create and at evaluate: a look applied every pass stacked
+warmth and contrast while the detail did not compound. Reset goes to every pass on a game cut, and to
+each extra pass on its own first frame. Cost is close to linear in the pass count.
 
 ## Design notes worth knowing before changing anything
 
