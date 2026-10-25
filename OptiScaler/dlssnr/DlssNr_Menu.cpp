@@ -231,36 +231,19 @@ void RenderMenu(Config* config, float menuResScale)
             ImGui::PopStyleColor(2);
 
             HelpMarker("How many times the model runs over each frame, each pass handed the previous"
-                       "
-one's answer. 1 is the default."
-                       "
-
-COST IS LINEAR. The model is about 98% of what this pass spends, so two"
-                       "
-passes take about twice the time and three about three times. Each extra"
-                       "
-pass also keeps a model of its own, with its own history, so VRAM grows with"
-                       "
-the count."
-                       "
-
-1 is what the model was trained for. Above it the model is enhancing its own"
-                       "
-output: detail compounds, and so does anything it got wrong. 3 is the ceiling --"
-                       "
-re-feeding converges, and a fourth pass would change almost nothing."
-                       "
-
-Detail repeats; tone does not. Local tone is applied by the first pass only,"
-                       "
-so the look does not stack warmth and contrast."
-                       "
-
-Model resolution below is how to pay for it: at 50% each pass costs about a"
-                       "
-quarter. A raised count takes one frame without the model while the new passes"
-                       "
-are built; on Vulkan any change is a brief hitch.");
+                       "\none's answer. 1 is the default."
+                       "\n\nCOST IS LINEAR. The model is about 98% of what this pass spends, so two"
+                       "\npasses take about twice the time and three about three times. Each extra"
+                       "\npass also keeps a model of its own, with its own history, so VRAM grows with"
+                       "\nthe count."
+                       "\n\n1 is what the model was trained for. Above it the model is enhancing its own"
+                       "\noutput: detail compounds, and so does anything it got wrong. 3 is the ceiling --"
+                       "\nre-feeding converges, and a fourth pass would change almost nothing."
+                       "\n\nDetail repeats; tone does not. Local tone is applied by the first pass only,"
+                       "\nso the look does not stack warmth and contrast."
+                       "\n\nModel resolution below is how to pay for it: at 50% each pass costs about a"
+                       "\nquarter. A raised count takes one frame without the model while the new passes"
+                       "\nare built; on Vulkan any change is a brief hitch.");
         }
 
         // Any percentage, rather than a handful of steps somebody chose in advance. The lower bound
